@@ -1,6 +1,60 @@
 # flake8: noqa
 # isort: skip_file
 # yapf: disable
+"""
+AutoSkills —— 自动技能检索与 DAG 执行引擎。
+
+【整体架构】
+
+用户 query
+   │
+   ▼
+AutoSkills.run(query)
+   │
+   ├─① get_skill_dag(query)          # 检索并规划
+   │     │
+   │     ├─ 模式A: enable_retrieve=False
+   │     │     └─ _direct_select_skills()   # 将全部 Skill 放入 LLM 上下文，一次性选择
+   │     │
+   │     └─ 模式B: enable_retrieve=True（Skill 数量 > 10 时自动开启）
+   │           ├─ _analyze_query()           # LLM 判断是否需要 Skill（还是纯聊天）
+   │           ├─ _async_retrieve_skills()   # HybridRetriever 并行检索候选 Skill
+   │           ├─ _filter_skills('fast')     # LLM 快速过滤（名称+描述）
+   │           ├─ _filter_skills('deep')     # LLM 深度过滤（含 Skill 内容）
+   │           └─ _build_dag()              # LLM 构建依赖 DAG + 执行顺序
+   │
+   └─② execute_dag(dag_result)       # 按 DAG 执行
+         └─ DAGExecutor.execute()
+               │
+               ├─ 串行节点: _execute_single_skill()
+               └─ 并行节点: _execute_parallel_group() → asyncio.gather()
+                     │
+                     └─ _execute_with_progressive_analysis()
+                           ├─ Phase 1: SkillAnalyzer.analyze_skill_plan()    # LLM 制定执行计划
+                           ├─ Phase 2: SkillAnalyzer.load_skill_resources()  # 按计划加载资源
+                           ├─ Phase 3: SkillAnalyzer.generate_execution_commands() # LLM 生成命令
+                           └─ 执行命令（含自我反思重试 _execute_command_with_retry）
+
+【关键数据结构】
+
+- SkillSchema:       单个 Skill 的元数据（id/name/description/scripts/content 等）
+- SkillContext:      执行上下文（含懒加载的 scripts/references/resources）
+- SkillExecutionPlan: LLM 分析后的执行计划（需要哪些脚本/包/步骤）
+- DAG:               Dict[skill_id, List[skill_id]]，邻接表，dag[A]=[B] 表示 A 依赖 B
+- execution_order:   List[skill_id | List[skill_id]]，子列表表示可并行执行的组
+
+【核心技术点】
+
+1. HybridRetriever:     稠密向量（Dense）+ 稀疏词频（Sparse）混合检索，召回相关 Skill
+2. 渐进式分析（Progressive Analysis）:
+     不一次性加载所有资源，而是先让 LLM 制定计划，再按需加载，减少 Token 消耗
+3. 自我反思（Self-Reflection）:
+     执行失败后，让 LLM 分析错误原因并修复代码，最多重试 max_retries 次
+4. 上下游数据链路:
+     上游 Skill 的 stdout/output_files 通过环境变量 UPSTREAM_OUTPUTS 注入下游 Skill
+5. 拓扑排序:
+     _topological_sort_dag() 对 DAG 做 Kahn 算法拓扑排序，保证依赖先于被依赖者执行
+"""
 import asyncio
 import logging
 import re
@@ -31,10 +85,13 @@ logger = get_logger()
 
 def _configure_logger_to_dir(log_dir: Path) -> None:
     """
-    Configure the logger to output to a specific directory.
+    将 logger 的输出重定向到指定目录下的文件（ms_agent.log）。
+
+    若该路径的 FileHandler 已存在则不重复添加，避免重复写日志。
+    会先移除旧的 FileHandler，再添加新的，保证同时只有一个文件输出目标。
 
     Args:
-        log_dir: Directory path for log files.
+        log_dir: 日志文件所在目录，不存在时会自动创建。
     """
     log_dir.mkdir(parents=True, exist_ok=True)
     log_file = log_dir / 'ms_agent.log'
@@ -60,13 +117,13 @@ def _configure_logger_to_dir(log_dir: Path) -> None:
 @dataclass
 class SkillExecutionResult:
     """
-    Result of executing a single skill.
+    单个 Skill 的执行结果。
 
     Attributes:
-        skill_id: Identifier of the executed skill.
-        success: Whether execution was successful.
-        output: ExecutionOutput from container.
-        error: Error message if execution failed.
+        skill_id: 被执行的 Skill 标识符。
+        success:  执行是否成功（exit_code == 0 时为 True）。
+        output:   容器返回的 ExecutionOutput，含 stdout/stderr/output_files 等。
+        error:    执行失败时的错误描述；成功时为 None。
     """
     skill_id: str
     success: bool = False
@@ -77,13 +134,13 @@ class SkillExecutionResult:
 @dataclass
 class DAGExecutionResult:
     """
-    Result of executing the entire skill DAG.
+    整个 Skill DAG 的执行汇总结果。
 
     Attributes:
-        success: Whether all skills executed successfully.
-        results: Dict mapping skill_id to SkillExecutionResult.
-        execution_order: Actual execution order (with parallel groups).
-        total_duration_ms: Total execution duration in milliseconds.
+        success:          所有 Skill 均执行成功时为 True；任一失败则为 False。
+        results:          Dict，key 为 skill_id，value 为对应的 SkillExecutionResult。
+        execution_order:  实际执行顺序（含并行组），与计划顺序一致或因失败提前终止而更短。
+        total_duration_ms: 从第一个 Skill 开始到最后一个 Skill 结束的总耗时（毫秒）。
     """
     success: bool = False
     results: Dict[str, SkillExecutionResult] = field(default_factory=dict)
@@ -91,32 +148,35 @@ class DAGExecutionResult:
     total_duration_ms: float = 0.0
 
     def get_skill_output(self, skill_id: str) -> Optional[ExecutionOutput]:
-        """Get output from a specific skill execution."""
+        """获取指定 Skill 的执行输出；若该 Skill 未执行则返回 None。"""
         result = self.results.get(skill_id)
         return result.output if result else None
 
 
 class SkillAnalyzer:
     """
-    Progressive skill analyzer for incremental context loading.
+    渐进式 Skill 分析器：分阶段加载上下文，避免一次性将所有资源塞给 LLM。
 
-    Implements two-phase analysis:
-    1. Plan Phase: Analyze skill metadata + content to create execution plan
-    2. Load Phase: Load only required resources based on plan
+    执行分为三个阶段：
+    1. Plan  阶段：仅读取 Skill 元数据 + SKILL.md 概览，让 LLM 制定执行计划
+    2. Load  阶段：根据计划按需加载脚本/参考文档/资源，而非全量加载
+    3. Exec  阶段：将加载的内容传给 LLM，生成具体可执行命令
+
+    设计动机：Skill 包可能包含大量文件，全量加载会消耗大量 Token 并干扰 LLM 判断。
+    渐进式加载只取"LLM 认为需要的"部分，显著降低 Token 消耗。
     """
 
     def __init__(self, llm: 'LLM'):
         """
-        Initialize skill analyzer.
+        初始化 SkillAnalyzer。
 
         Args:
-            llm: LLM instance for analysis.
+            llm: 用于计划制定和命令生成的 LLM 实例。
         """
         self.llm = llm
 
     def _llm_generate(self, prompt: str) -> str:
-        """Generate LLM response from prompt."""
-        from ms_agent.llm.utils import Message
+        """将 prompt 封装成 user message 发给 LLM，返回文本响应。"""
         messages = [Message(role='user', content=prompt)]
         logger.debug(f'Input msg to LLM in SkillAnalyzer: {messages}')
         response = self.llm.generate(messages=messages)
@@ -126,7 +186,16 @@ class SkillAnalyzer:
         return res
 
     def _parse_json_response(self, response: str) -> Dict[str, Any]:
-        """Parse JSON from LLM response with robust extraction."""
+        """
+        从 LLM 响应中鲁棒地解析 JSON。
+
+        LLM 有时会在 JSON 前后包裹 Markdown 代码块（```json ... ```），
+        或在 JSON 前后添加说明文字。此方法按以下顺序尝试解析：
+        1. 去掉 Markdown 代码块后直接 json.loads
+        2. 找最外层 {} 括号对，提取后解析
+        3. 用正则 \\{[\\s\\S]*\\} 匹配，提取后解析
+        全部失败则返回空 dict 并记录警告。
+        """
         # Remove markdown code blocks if present
         response = re.sub(r'```json\s*', '', response)
         response = re.sub(r'```\s*$', '', response)
@@ -172,17 +241,19 @@ class SkillAnalyzer:
                            query: str,
                            root_path: Path = None) -> SkillContext:
         """
-        Phase 1: Analyze skill and create execution plan.
+        Phase 1：分析 Skill 并生成执行计划（只读元数据，不加载脚本资源）。
 
-        Only loads skill metadata and content (SKILL.md), not scripts/resources.
+        向 LLM 提供 Skill 的名称、描述、SKILL.md 概览（最多 4000 字符），
+        以及可用脚本/参考/资源的文件名列表（不含内容），
+        让 LLM 判断该 Skill 能否处理 query，并规划所需的脚本、包、步骤。
 
         Args:
-            skill: SkillSchema to analyze.
-            query: User's query to fulfill.
-            root_path: Root path for skill context.
+            skill:     待分析的 SkillSchema 对象。
+            query:     用户的原始任务描述。
+            root_path: Skill 上下文的根路径，默认为 skill 文件所在目录的父目录。
 
         Returns:
-            SkillContext with execution plan (resources not yet loaded).
+            SkillContext，其中 plan 字段已填充执行计划；资源尚未加载（懒加载）。
         """
         # Create context with lazy loading
         context = SkillContext(
@@ -229,13 +300,16 @@ class SkillAnalyzer:
 
     def load_skill_resources(self, context: SkillContext) -> SkillContext:
         """
-        Phase 2: Load resources based on execution plan.
+        Phase 2：根据 Phase 1 生成的执行计划，按需加载 Skill 资源。
+
+        仅加载计划中声明要使用的脚本/参考文档/资源，而非全量加载。
+        若 plan 为空或 can_handle=False，跳过加载直接返回。
 
         Args:
-            context: SkillContext with plan from Phase 1.
+            context: 包含 Phase 1 计划的 SkillContext。
 
         Returns:
-            SkillContext with loaded resources.
+            加载了所需资源后的 SkillContext（scripts/references/resources 已填充）。
         """
         if not context.plan or not context.plan.can_handle:
             logger.warning('No valid plan, skipping resource loading')
@@ -251,13 +325,20 @@ class SkillAnalyzer:
     def generate_execution_commands(
             self, context: SkillContext) -> List[Dict[str, Any]]:
         """
-        Generate execution commands from loaded context.
+        Phase 3：根据已加载的资源，生成具体可执行命令列表。
+
+        将执行计划 + 脚本内容 + 参考文档发送给 LLM，
+        让 LLM 输出一组结构化命令（python_code / python_script / shell / javascript）。
+
+        若 LLM 未生成任何命令（空列表），则回退策略：
+        - 尝试加载 Skill 目录中所有脚本
+        - 将 .py 文件构造为 python_code 命令，.sh 文件构造为 shell 命令
 
         Args:
-            context: SkillContext with loaded resources.
+            context: 已加载资源的 SkillContext。
 
         Returns:
-            List of execution command dictionaries.
+            命令字典列表，每个 dict 含 type/code/path/requirements 等字段。
         """
         if not context.plan:
             return []
@@ -319,15 +400,20 @@ class SkillAnalyzer:
             root_path: Path = None
     ) -> Tuple[SkillContext, List[Dict[str, Any]]]:
         """
-        Complete progressive analysis: plan -> load -> generate commands.
+        渐进式分析的完整入口：依次执行 Plan → Load → GenerateCommands 三阶段。
+
+        三个阶段均通过 asyncio.to_thread 在线程池中运行（避免阻塞事件循环），
+        支持在异步环境下并发执行多个 Skill 的分析。
+
+        若 Phase 1 判断 can_handle=False，立即返回 (context, [])，不执行后续阶段。
 
         Args:
-            skill: SkillSchema to analyze.
-            query: User's query.
-            root_path: Root path for context.
+            skill:     待分析的 SkillSchema。
+            query:     用户任务描述。
+            root_path: Skill 上下文根路径。
 
         Returns:
-            Tuple of (SkillContext, execution_commands).
+            (SkillContext, 命令列表)。若 Skill 无法处理 query，命令列表为空。
         """
         # Phase 1: Create plan
         context = await asyncio.to_thread(self.analyze_skill_plan, skill,
@@ -349,16 +435,16 @@ class SkillAnalyzer:
 @dataclass
 class SkillDAGResult:
     """
-    Result of AutoSkills run containing the skill execution DAG.
+    AutoSkills 一次运行的完整结果，包含 Skill 选择、DAG 结构和执行结果。
 
     Attributes:
-        dag: Adjacency list representation of skill dependencies.
-        execution_order: Topologically sorted list of skill_ids (sublists = parallel).
-        selected_skills: Dict of selected SkillSchema objects.
-        is_complete: Whether the skills are sufficient for the task.
-        clarification: Optional clarification question if skills are insufficient.
-        chat_response: Direct response if no skills needed (chat-only mode).
-        execution_result: Result of DAG execution (populated after execute_dag).
+        dag:              邻接表，dag[A]=[B,C] 表示 A 依赖 B 和 C。
+        execution_order:  拓扑排序后的执行顺序；子列表中的 Skill 可并行执行。
+        selected_skills:  最终选定的 Skill 字典（skill_id → SkillSchema）。
+        is_complete:      当前选出的 Skill 是否足以完成任务。
+        clarification:    若 Skill 不足，包含向用户请求补充信息的提示语。
+        chat_response:    纯聊天模式下（无需 Skill）的直接回复文本。
+        execution_result: DAG 执行完毕后填充，包含每个 Skill 的执行结果汇总。
     """
     dag: Dict[str, List[str]] = field(default_factory=dict)
     execution_order: List[Union[str, List[str]]] = field(default_factory=list)
@@ -369,7 +455,7 @@ class SkillDAGResult:
     execution_result: Optional[DAGExecutionResult] = None
 
     def to_dict(self) -> Dict[str, Any]:
-        """Convert SkillDAGResult to dictionary."""
+        """将 SkillDAGResult 序列化为普通字典，便于 JSON 输出或日志记录。"""
         return {
             'dag':
             self.dag,
@@ -391,11 +477,17 @@ class SkillDAGResult:
 
 class DAGExecutor:
     """
-    Executor for skill DAG with dependency-aware parallel execution.
+    Skill DAG 的执行引擎，支持依赖感知的并行执行。
 
-    Handles execution order parsing, input/output linking between skills,
-    and parallel execution of independent skills.
-    Supports progressive skill analysis for incremental context loading.
+    核心职责：
+    - 按 execution_order 依次（或并行）执行各 Skill
+    - 将上游 Skill 的输出通过环境变量注入下游 Skill（数据链路）
+    - 支持渐进式分析（Progressive Analysis）：Plan → Load → Execute
+    - 支持自我反思重试（Self-Reflection）：失败后让 LLM 修复代码再重试
+
+    并行策略：
+      execution_order 中的子列表（List[str]）表示可并行的 Skill 组，
+      通过 asyncio.gather 并发执行；单个字符串则串行执行。
     """
 
     def __init__(self,
@@ -407,16 +499,21 @@ class DAGExecutor:
                  enable_self_reflection: bool = True,
                  max_retries: int = 3):
         """
-        Initialize DAG executor.
+        初始化 DAGExecutor。
 
         Args:
-            container: SkillContainer for executing skills.
-            skills: Dict of skill_id to SkillSchema.
-            workspace_dir: Optional workspace directory for skill execution.
-            llm: LLM instance for progressive skill analysis.
-            enable_progressive_analysis: Whether to use progressive analysis.
-            enable_self_reflection: Whether to analyze errors and retry on failure.
-            max_retries: Maximum retry attempts for failed executions.
+            container:                   执行 Skill 的沙箱容器（Docker 或本地）。
+            skills:                      全量 Skill 字典（skill_id → SkillSchema）。
+            workspace_dir:               Skill 执行的工作目录，默认使用 container.workspace_dir。
+            llm:                         用于渐进式分析和自我反思的 LLM 实例；为 None 时两者均禁用。
+            enable_progressive_analysis: 是否启用渐进式分析（需要 llm 不为 None）。
+            enable_self_reflection:      是否启用自我反思重试（需要 llm 不为 None）。
+            max_retries:                 每个 Skill 的最大重试次数（含首次执行）。
+
+        内部状态：
+            _outputs:            已执行 Skill 的输出缓存，供下游 Skill 引用。
+            _contexts:           各 Skill 的 SkillContext，用于记录分析结果。
+            _execution_attempts: 各 Skill 的已尝试执行次数，用于日志。
         """
         self.container = container
         self.skills = skills
@@ -443,14 +540,10 @@ class DAGExecutor:
     def _get_skill_dependencies(self, skill_id: str,
                                 dag: Dict[str, List[str]]) -> List[str]:
         """
-        Get direct dependencies of a skill from the DAG.
+        从 DAG 中获取指定 Skill 的直接前置依赖列表。
 
-        Args:
-            skill_id: The skill to get dependencies for.
-            dag: Adjacency list where dag[A] = [B, C] means A depends on B, C.
-
-        Returns:
-            List of skill_ids that this skill depends on.
+        dag[A] = [B, C] 表示 A 依赖 B 和 C，故返回 [B, C]。
+        若 skill_id 不在 DAG 中（无依赖），返回空列表。
         """
         return dag.get(skill_id, [])
 
@@ -460,15 +553,19 @@ class DAGExecutor:
             dag: Dict[str, List[str]],
             execution_input: Optional[ExecutionInput] = None) -> ExecutionInput:
         """
-        Build execution input for a skill, linking outputs from dependencies.
+        为指定 Skill 构建执行输入，将上游依赖的输出注入为环境变量。
+
+        以 base_input 为基础，查找所有上游依赖 Skill 的执行输出，
+        将其 stdout/stderr/exit_code/output_files 序列化为 JSON，
+        写入环境变量 UPSTREAM_OUTPUTS 传给下游进程。
 
         Args:
-            skill_id: The skill to build input for.
-            dag: Skill dependency DAG.
-            execution_input: Optional user-provided input.
+            skill_id:        当前要执行的 Skill ID。
+            dag:             技能依赖 DAG（邻接表）。
+            execution_input: 用户提供的原始输入（可为 None）。
 
         Returns:
-            ExecutionInput with linked dependency outputs.
+            注入了上游输出的 ExecutionInput。
         """
         base_input = execution_input or ExecutionInput()
 
@@ -490,6 +587,13 @@ class DAGExecutor:
                      for k, v in dep_output.output_files.items()},
                 }
 
+        # ── 上游输出注入 ──────────────────────────────────────────────
+        # DAG 中，下游 Skill 需要感知上游 Skill 的产出。
+        # 这里的做法是：把所有上游输出序列化成 JSON，
+        # 通过环境变量 UPSTREAM_OUTPUTS 传给下游进程。
+        # 下游脚本可用 os.environ['UPSTREAM_OUTPUTS'] 读取。
+        # 对于较长的 stdout，还单独提供 UPSTREAM_{ID}_STDOUT 便于快速访问。
+        # ─────────────────────────────────────────────────────────────
         # Inject upstream data into environment variables as JSON
         env_vars = base_input.env_vars.copy()
         if upstream_data:
@@ -513,13 +617,13 @@ class DAGExecutor:
 
     def _determine_executor_type(self, skill: SkillSchema) -> ExecutorType:
         """
-        Determine the executor type based on skill scripts.
+        根据 Skill 的主脚本文件扩展名确定执行器类型。
 
-        Args:
-            skill: SkillSchema to analyze.
-
-        Returns:
-            ExecutorType for the skill's primary script.
+        判断规则（取第一个脚本的类型）：
+        - .py              → PYTHON_SCRIPT
+        - .sh / .bash      → SHELL
+        - .js / .mjs       → JAVASCRIPT
+        - 无脚本或未知扩展名 → PYTHON_CODE（直接执行 skill.content 字符串）
         """
         if not skill.scripts:
             return ExecutorType.PYTHON_CODE
@@ -544,21 +648,22 @@ class DAGExecutor:
             execution_input: Optional[ExecutionInput] = None,
             query: str = '') -> SkillExecutionResult:
         """
-        Execute a single skill with dependency-linked input.
+        执行单个 Skill，自动处理上游依赖输入注入和执行模式选择。
 
-        Uses progressive analysis if enabled:
-        1. Analyze skill to create execution plan
-        2. Load only required resources
-        3. Generate and execute commands
+        执行流程：
+        1. 从 DAG 中收集上游依赖的输出，构建 ExecutionInput
+        2. 若启用渐进式分析 → 调用 _execute_with_progressive_analysis
+           否则 → 调用 _execute_direct（直接运行脚本文件）
+        3. 捕获所有异常，确保单个 Skill 失败不会崩溃整个 DAG
 
         Args:
-            skill_id: ID of the skill to execute.
-            dag: Skill dependency DAG.
-            execution_input: Optional user-provided input.
-            query: User query for progressive analysis.
+            skill_id:        要执行的 Skill 标识符。
+            dag:             技能依赖 DAG。
+            execution_input: 用户提供的初始输入（可为 None）。
+            query:           用户原始 query，供渐进式分析使用。
 
         Returns:
-            SkillExecutionResult with execution outcome.
+            SkillExecutionResult，无论成功或失败均返回（不抛出异常）。
         """
         skill = self.skills.get(skill_id)
         if not skill:
@@ -598,6 +703,30 @@ class DAGExecutor:
 
         Returns:
             SkillExecutionResult with execution outcome.
+
+        【渐进式分析（Progressive Analysis）的设计意图】
+
+        朴素做法：把 Skill 的所有脚本、资源、文档一股脑塞给 LLM，让它生成执行命令。
+        问题：Token 浪费严重，且 Skill 包内容越多越容易让 LLM 迷失。
+
+        渐进式做法（三阶段）：
+          Phase 1 — 制定计划（analyze_skill_plan）
+            仅提供 Skill 的元数据（名称/描述/SKILL.md 概览），
+            让 LLM 判断该 Skill 能否处理当前 query，
+            并列出执行所需的具体脚本、参考文档、Python 包。
+            → 输出：SkillExecutionPlan（can_handle / required_scripts / ...）
+
+          Phase 2 — 按需加载（load_skill_resources）
+            根据 Phase 1 的计划，只加载"声明要用到"的资源，而非全部。
+            → 减少无关内容对 LLM 的干扰，降低 Token 消耗。
+
+          Phase 3 — 生成命令（generate_execution_commands）
+            把已加载的脚本内容 + 执行计划传给 LLM，
+            让它生成具体的执行命令（python_code / python_script / shell / javascript）。
+            → 输出：List[Dict]，每个 dict 是一条可执行的命令。
+
+        若 Phase 1 判断 can_handle=False，直接返回失败，不执行后续阶段。
+        若 Phase 3 未生成任何命令，回退到直接执行 Skill 目录中的脚本文件。
         """
         # Phase 1 & 2: Analyze and load resources
         # Use skill's directory as root_path for proper file resolution
@@ -666,15 +795,14 @@ class DAGExecutor:
             self, skill: SkillSchema, skill_id: str,
             exec_input: ExecutionInput) -> SkillExecutionResult:
         """
-        Execute skill directly without progressive analysis.
+        不经过渐进式分析，直接执行 Skill 的脚本文件（降级模式）。
 
-        Args:
-            skill: SkillSchema to execute.
-            skill_id: Skill identifier.
-            exec_input: Execution input.
+        适用场景：enable_progressive_analysis=False，或 LLM 不可用时。
+        执行逻辑：
+        - 若 Skill 有脚本文件 → 执行第一个脚本（按扩展名决定执行器类型）
+        - 若无脚本 → 将 skill.content 作为 Python 代码字符串执行
 
-        Returns:
-            SkillExecutionResult with execution outcome.
+        执行完成后将输出写入 _outputs 并通知容器（用于上下游数据链路）。
         """
         # Mount skill directory for sandbox access
         self.container.mount_skill_directory(skill_id, skill.skill_path)
@@ -707,17 +835,27 @@ class DAGExecutor:
                                skill_id: str, exec_input: ExecutionInput,
                                context: SkillContext) -> ExecutionOutput:
         """
-        Execute a single command from progressive analysis.
+        执行渐进式分析生成的单条命令。
+
+        根据 cmd_type 路由到不同的容器执行方法：
+        - python_script: 执行指定路径的 .py 文件（先在 skill_dir 找，找不到再在 root_path 找）
+        - python_code:   直接执行代码字符串
+        - shell:         执行 shell 命令字符串
+        - javascript:    执行 JS 代码字符串
+        - 其他/未知:     降级为 python_code
+
+        执行前会合并三处来源的 Python 包依赖（plan/cmd/exec_input），去重后传给容器。
+        命令参数（parameters）会同时注入 args、kwargs 和环境变量（大写 key）。
 
         Args:
-            cmd: Command dictionary.
-            cmd_type: Type of command (python_script, shell, etc.).
-            skill_id: Skill identifier.
-            exec_input: Base execution input.
-            context: SkillContext with loaded resources.
+            cmd:        命令字典（含 type/code/path/parameters/requirements）。
+            cmd_type:   命令类型字符串。
+            skill_id:   当前 Skill 标识符。
+            exec_input: 基础执行输入（含上游注入的环境变量）。
+            context:    已加载资源的 SkillContext。
 
         Returns:
-            ExecutionOutput from command execution.
+            ExecutionOutput（含 stdout/stderr/exit_code/output_files）。
         """
         # Merge parameters into input
         params = cmd.get('parameters', {})
@@ -814,6 +952,29 @@ class DAGExecutor:
 
         Returns:
             ExecutionOutput from command execution.
+
+        【自我反思（Self-Reflection）重试机制】
+
+        普通重试：失败后原封不动重试，对「代码本身有 bug」的情况无效。
+
+        自我反思重试（Self-Reflection）：
+          每次执行失败后，将失败代码 + stderr + stdout 传给 LLM，
+          让 LLM 分析错误原因并给出修复后的代码，再用修复版重试。
+
+        流程：
+          for attempt in 1..max_retries:
+              执行当前 cmd
+              if 成功 → return
+              if 不是最后一次 且 cmd_type 是 Python 代码:
+                  _analyze_execution_error() → LLM 返回 {is_fixable, fixed_code, additional_requirements}
+                  if is_fixable → 替换 cmd['code'] 为 fixed_code（下一轮用修复版）
+                  if 需要额外包 → 更新 exec_input.requirements
+          return 最后一次执行结果（即使失败）
+
+        局限性：
+        - 自我反思只对 python_code / python_script 类型生效（shell/js 直接重试）
+        - LLM 不一定能修复所有错误（如缺少外部服务、权限不足等）
+        - max_retries 默认为 3，避免无限循环消耗 Token
         """
         current_cmd = cmd.copy()
         last_output = None
@@ -889,7 +1050,15 @@ class DAGExecutor:
 
     def _merge_outputs(self,
                        outputs: List[ExecutionOutput]) -> ExecutionOutput:
-        """Merge multiple execution outputs into one."""
+        """
+        将多条命令的输出合并为一个 ExecutionOutput。
+
+        合并规则：
+        - stdout/stderr: 用换行符拼接所有非空输出
+        - exit_code:     取第一个非 0 的 exit_code；全部为 0 则结果为 0
+        - duration_ms:   所有命令耗时之和
+        - output_files:  合并所有命令产生的输出文件（后者覆盖同名文件）
+        """
         if not outputs:
             return ExecutionOutput()
         if len(outputs) == 1:
@@ -922,17 +1091,23 @@ class DAGExecutor:
             query: str,
             attempt: int) -> Dict[str, Any]:
         """
-        Analyze failed execution and generate a fix using LLM.
+        对执行失败的代码进行 LLM 错误分析，返回修复方案。
 
-        Args:
-            skill: The skill that failed.
-            failed_code: The code that failed.
-            output: ExecutionOutput with error details.
-            query: Original user query.
-            attempt: Current retry attempt number.
+        将失败代码、stderr（最多 3000 字符）、stdout（最多 1000 字符）
+        以及当前重试次数发送给 LLM，请求其分析错误原因并给出修复后的代码。
 
-        Returns:
-            Dict with error analysis and fixed code.
+        返回字典结构：
+        {
+            "error_analysis": {
+                "error_type":  错误类型（如 ImportError / TypeError 等）,
+                "is_fixable":  是否可通过修改代码修复（bool）,
+                "reason":      错误原因描述
+            },
+            "fixed_code":            修复后的完整代码字符串（可为 None）,
+            "additional_requirements": 需要额外安装的 Python 包列表
+        }
+
+        若 LLM 不可用或解析失败，返回 is_fixable=False 的兜底结果。
         """
         if not self.llm:
             return {'error_analysis': {'is_fixable': False},
@@ -1415,6 +1590,22 @@ class AutoSkills:
 
         Returns:
             Dict containing 'filtered_skill_ids', 'dag', and 'execution_order'.
+
+        【DAG 结构说明】
+        LLM 返回的 DAG 是邻接表格式：
+            dag[A] = [B, C]  表示 Skill A 依赖于 B 和 C（B、C 必须先于 A 执行）
+
+        execution_order 是拓扑排序结果，格式：
+            ["skill_b", "skill_c", ["skill_d", "skill_e"], "skill_a"]
+            - 字符串：串行执行
+            - 列表：该组内 Skill 可并行执行
+
+        如果 LLM 未给出 execution_order，则由 _topological_sort_dag() 自动推导。
+
+        校验逻辑：
+        - LLM 可能幻觉出不存在的 skill_id，这里过滤掉非候选集中的 id
+        - DAG 依赖项也只保留候选集内的合法 id
+        - 若 LLM 过滤后为空，保守地保留全部候选（避免误删）
         """
         skills_info = self._format_retrieved_skills(skill_ids)
         prompt = PROMPT_BUILD_SKILLS_DAG.format(
@@ -1499,10 +1690,32 @@ class AutoSkills:
 
         Returns:
             Topologically sorted list of skill IDs (dependencies first).
+
+        【算法：Kahn 算法（BFS 拓扑排序）】
+        约定：dag[A] = [B] 表示 A 依赖 B，即 B 必须先于 A 执行。
+        入度（in_degree）定义：节点 A 的入度 = A 依赖的节点数量（即 len(dag[A])）。
+        入度为 0 的节点没有前置依赖，可以最先执行。
+
+        步骤：
+        1. 计算每个节点的入度（= 其依赖列表长度）
+        2. 将所有入度为 0 的节点加入队列
+        3. 每次从队列取出一个节点，加入结果序列
+        4. 将所有"依赖了该节点"的后续节点入度 -1；若入度降为 0，加入队列
+        5. 重复直到队列为空
+
+        注意：本实现中前面有一段被覆盖的 in_degree 初始化代码（第一个循环），
+        属于死代码——它计算的 in_degree 会被后面的赋值语句 in_degree[node] = len(deps) 覆盖。
+        实际生效的逻辑从 `in_degree = {node: 0 for node in dag}` 重新开始。
+
+        若存在环或孤立节点，result 不包含所有节点，剩余节点会追加到末尾并记录警告。
         """
         if not dag:
             return []
 
+        # ── 注意：下面这段 in_degree 初始化是死代码 ──────────────────
+        # 这里的 pass 什么都没做，紧接着的循环也只是检查 dep 是否在 in_degree 里，
+        # 但这个 in_degree 字典会在后面被完全重新赋值，所以这段逻辑无实际作用。
+        # ──────────────────────────────────────────────────────────────
         # Calculate in-degree for each node
         in_degree = {node: 0 for node in dag}
         for node, deps in dag.items():
@@ -1515,6 +1728,10 @@ class AutoSkills:
                 if dep not in in_degree:
                     in_degree[dep] = 0
 
+        # ── 实际生效的入度计算从这里开始 ─────────────────────────────
+        # 入度 = 该节点依赖的前置节点数（即 dag[node] 的长度）
+        # 入度为 0 → 无前置依赖 → 可以最先执行
+        # ──────────────────────────────────────────────────────────────
         # Recalculate: in dag[A] = [B], A depends on B, so B must come before A
         # We need to build reverse mapping
         in_degree = {node: 0 for node in dag}
@@ -1642,6 +1859,29 @@ class AutoSkills:
 
         Returns:
             SkillDAGResult containing the skill execution DAG.
+
+        【检索流水线详解】
+        Step 1  _analyze_query()
+                  LLM 判断 query 是否需要 Skill（区分「纯聊天」vs「需要执行」），
+                  同时将原始 query 拆解为多个更精准的 skill_queries（子查询），
+                  提升后续检索的召回率。
+
+        Step 2  _async_retrieve_skills()
+                  对每个子查询并行调用 HybridRetriever，合并去重后得到候选 Skill 集合。
+                  HybridRetriever = BM25（稀疏）+ 向量相似度（稠密）混合打分。
+
+        Step 3  _filter_skills('fast') + _filter_skills('deep')
+                  两轮 LLM 过滤：
+                  - fast: 只看名称+描述，快速淘汰明显不相关的 Skill
+                  - deep: 看 Skill 完整内容，精细判断能否执行当前任务
+                  两轮设计的目的：先快速缩小候选集，再对少量候选做精细分析，
+                  在准确率和 Token 消耗之间取得平衡。
+
+        Step 4  _build_dag()
+                  LLM 在过滤后的 Skill 集合上：
+                  a) 再次过滤（最终确认）
+                  b) 分析 Skill 间依赖关系，构建 DAG
+                  c) 给出拓扑排序后的执行顺序（含并行分组）
         """
         if not self.all_skills:
             logger.warning('No skills loaded, returning empty result')
