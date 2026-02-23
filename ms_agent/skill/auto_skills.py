@@ -1145,16 +1145,19 @@ class DAGExecutor:
             execution_input: Optional[ExecutionInput] = None,
             query: str = '') -> List[SkillExecutionResult]:
         """
-        Execute a group of skills in parallel.
+        并行执行一组相互独立的 Skill（它们之间没有依赖关系）。
+
+        使用 asyncio.gather 并发启动所有 Skill 的执行任务，
+        等待全部完成后返回结果列表（顺序与 skill_ids 一致）。
 
         Args:
-            skill_ids: List of skill_ids to execute concurrently.
-            dag: Skill dependency DAG.
-            execution_input: Optional user-provided input.
-            query: User query for progressive analysis.
+            skill_ids:       要并行执行的 Skill ID 列表。
+            dag:             技能依赖 DAG（用于注入各自的上游输出）。
+            execution_input: 用户提供的初始输入，所有并行 Skill 共享。
+            query:           用户 query，供渐进式分析使用。
 
         Returns:
-            List of SkillExecutionResult for each skill.
+            每个 Skill 的 SkillExecutionResult 列表。
         """
         tasks = [
             self._execute_single_skill(sid, dag, execution_input, query)
