@@ -1172,21 +1172,24 @@ class DAGExecutor:
                       stop_on_failure: bool = True,
                       query: str = '') -> DAGExecutionResult:
         """
-        Execute the skill DAG according to execution order.
+        按 execution_order 执行整个 Skill DAG。
 
-        Execution order format: [skill1, skill2, [skill3, skill4], skill5, ...]
-        - Single string items are executed sequentially
-        - List items (sublists) are executed in parallel
+        执行格式：
+        - 字符串项：串行执行单个 Skill
+        - 列表项（子列表）：并行执行该组内所有 Skill
+
+        若 stop_on_failure=True，任一 Skill（或并行组中任一 Skill）失败后立即停止。
+        无论是否提前停止，均记录已执行的实际顺序（actual_order）。
 
         Args:
-            dag: Skill dependency DAG (adjacency list).
-            execution_order: Ordered list with parallel groups as sublists.
-            execution_input: Optional initial input for all skills.
-            stop_on_failure: Whether to stop execution on first failure.
-            query: User query for progressive skill analysis.
+            dag:             技能依赖 DAG（邻接表）。
+            execution_order: 拓扑排序后的执行顺序（含并行分组）。
+            execution_input: 所有 Skill 共用的初始输入。
+            stop_on_failure: 是否在首次失败后停止执行。
+            query:           用户 query，供渐进式分析使用。
 
         Returns:
-            DAGExecutionResult with all execution outcomes.
+            DAGExecutionResult（含各 Skill 的结果、实际执行顺序、总耗时）。
         """
         import time
         start_time = time.time()
@@ -1234,25 +1237,33 @@ class DAGExecutor:
             total_duration_ms=total_duration)
 
     def get_skill_context(self, skill_id: str) -> Optional[SkillContext]:
-        """Get the skill context from progressive analysis."""
+        """获取指定 Skill 的渐进式分析上下文；若未执行过则返回 None。"""
         return self._contexts.get(skill_id)
 
     def get_all_contexts(self) -> Dict[str, SkillContext]:
-        """Get all skill contexts from progressive analysis."""
+        """获取所有已执行 Skill 的上下文字典（返回副本，避免外部修改内部状态）。"""
         return self._contexts.copy()
 
     def get_executed_skill_ids(self) -> List[str]:
-        """Get list of skill_ids that have been executed with contexts."""
+        """返回所有已完成渐进式分析（有 SkillContext 记录）的 Skill ID 列表。"""
         return list(self._contexts.keys())
 
 
 class AutoSkills:
     """
-    Automatic skill retrieval and DAG construction for user queries.
+    自动化 Skill 检索与 DAG 执行的核心入口类。
 
-    Uses hybrid retrieval (dense + sparse) to find relevant skills,
-    with LLM-based analysis and reflection loop for completeness checking.
-    Supports DAG-based skill execution with dependency management.
+    主要功能：
+    1. 从本地目录或 ModelScope 仓库加载 Skill 库
+    2. 根据用户 query 自动检索相关 Skill（HybridRetriever 或直接 LLM 选择）
+    3. 用 LLM 分析 Skill 间依赖关系，构建执行 DAG
+    4. 按 DAG 顺序执行 Skill（支持串行/并行/渐进式分析/自我反思重试）
+
+    两种检索模式（由 enable_retrieve 控制）：
+    - True（检索模式）:  HybridRetriever 召回 + 两轮 LLM 过滤 + DAG 构建
+    - False（直接模式）: 将所有 Skill 列表直接传给 LLM，由 LLM 一次性选择
+
+    自动模式切换：enable_retrieve=None 时，Skill 数量 > 10 自动开启检索模式。
     """
 
     def __init__(self,
@@ -1352,7 +1363,13 @@ class AutoSkills:
         self._executor: Optional[DAGExecutor] = None
 
     def _build_corpus(self):
-        """Build corpus from skills for retriever indexing."""
+        """
+        将所有 Skill 构建为检索语料库。
+
+        每个 Skill 生成一条文档字符串："[skill_id] name: description"，
+        同时建立文档字符串 → skill_id 的反向映射（corpus_to_skill_id），
+        供检索结果还原 skill_id 使用。
+        """
         for skill_id, skill in self.all_skills.items():
             # Concatenate skill_id, name, description as corpus document
             doc = f'[{skill_id}] {skill.name}: {skill.description}'
@@ -1360,7 +1377,12 @@ class AutoSkills:
             self.corpus_to_skill_id[doc] = skill_id
 
     def _extract_skill_id_from_doc(self, doc: str) -> Optional[str]:
-        """Extract skill_id from corpus document string."""
+        """
+        从语料库文档字符串中提取 skill_id。
+
+        优先通过 corpus_to_skill_id 字典直接查找（O(1)）；
+        若找不到（文档字符串被截断或格式变化），则用正则从 [skill_id] 前缀提取。
+        """
         # First try direct lookup
         if doc in self.corpus_to_skill_id:
             return self.corpus_to_skill_id[doc]
@@ -1369,7 +1391,15 @@ class AutoSkills:
         return match.group(1) if match else None
 
     def _parse_json_response(self, response: str) -> Dict[str, Any]:
-        """Parse JSON from LLM response with robust extraction."""
+        """
+        从 LLM 响应中鲁棒地解析 JSON（AutoSkills 类内版本，逻辑与 SkillAnalyzer 一致）。
+
+        解析策略（依次尝试）：
+        1. 去掉 Markdown 代码块后直接 json.loads
+        2. 找最外层 {} 括号对，提取后解析
+        3. 用正则 \\{[\\s\\S]*\\} 匹配，提取后解析
+        全部失败则返回空 dict 并记录警告。
+        """
         # Remove markdown code blocks if present
         response = re.sub(r'```json\s*', '', response)
         response = re.sub(r'```\s*$', '', response)
@@ -1411,7 +1441,12 @@ class AutoSkills:
         return {}
 
     def _get_skills_overview(self, limit: int = 20) -> str:
-        """Generate a brief overview of all available skills."""
+        """
+        生成所有 Skill 的简要概览文本，用于 _analyze_query 的 prompt。
+
+        每个 Skill 格式为："- [skill_id] name: description（最多 200 字符）"
+        最多返回 limit 条（默认 20），避免 prompt 过长导致 Token 溢出。
+        """
         lines = []
         for skill_id, skill in self.all_skills.items():
             lines.append(
@@ -1419,14 +1454,23 @@ class AutoSkills:
         return '\n'.join(lines[:limit])  # Limit to avoid token overflow
 
     def _get_all_skills_context(self) -> str:
-        """Generate full context of all skills for direct LLM selection."""
+        """
+        生成所有 Skill 的完整上下文文本，用于直接选择模式（enable_retrieve=False）的 prompt。
+
+        包含每个 Skill 的名称和完整描述（不截断），供 LLM 一次性阅读所有 Skill 后选择。
+        """
         lines = []
         for skill_id, skill in self.all_skills.items():
             lines.append(f'- [{skill_id}] {skill.name}\n  {skill.description}')
         return '\n'.join(lines)
 
     def _format_retrieved_skills(self, skill_ids: Set[str]) -> str:
-        """Format retrieved skills for LLM prompt."""
+        """
+        将候选 Skill 格式化为 LLM prompt 所需的文本块。
+
+        包含每个 Skill 的 skill_id、名称、描述和 SKILL.md 内容（最多 3000 字符），
+        用于 _build_dag 阶段让 LLM 深入理解 Skill 能力后构建依赖 DAG。
+        """
         lines = []
         for skill_id in skill_ids:
             if skill_id in self.all_skills:
@@ -1436,8 +1480,7 @@ class AutoSkills:
         return '\n'.join(lines)
 
     def _llm_generate(self, prompt: str) -> str:
-        """Generate LLM response from prompt."""
-        messages = [Message(role='user', content=prompt)]
+        """将 prompt 封装成 user message 发给 LLM，返回文本响应（同步版本）。"""
         logger.debug(f'Input msg to LLM: {messages}')       # set env `LOG_LEVEL=DEBUG`
         response = self.llm.generate(messages=messages)
         res = response.content if hasattr(response,
@@ -1446,7 +1489,7 @@ class AutoSkills:
         return res
 
     async def _async_llm_generate(self, prompt: str) -> str:
-        """Async wrapper for LLM generation."""
+        """_llm_generate 的异步包装：在线程池中运行，避免阻塞异步事件循环。"""
         return await asyncio.to_thread(self._llm_generate, prompt)
 
     def _analyze_query(
@@ -1454,13 +1497,16 @@ class AutoSkills:
         query: str,
     ) -> Tuple[bool, str, List[str], Optional[str]]:
         """
-        Analyze user query to determine if skills are needed.
+        分析用户 query，判断是否需要调用 Skill，并生成面向检索的子查询列表。
 
-        Args:
-            query: User's original query.
+        向 LLM 提供全量 Skill 名称/描述概览，让其判断：
+        - needs_skills:   该 query 是否需要执行 Skill（False 表示纯聊天，直接回复即可）
+        - intent_summary: 对 query 意图的简洁概括
+        - skill_queries:  将 query 拆解后的多个检索子查询（提升检索召回率）
+        - chat_response:  若 needs_skills=False，此字段包含直接的文字回复
 
         Returns:
-            Tuple of (needs_skills, intent_summary, skill_queries, chat_response).
+            (needs_skills, intent_summary, skill_queries, chat_response)
         """
         prompt = PROMPT_ANALYZE_QUERY_FOR_SKILLS.format(
             query=query, skills_overview=self._get_skills_overview())
@@ -1476,13 +1522,17 @@ class AutoSkills:
 
     async def _async_retrieve_skills(self, queries: List[str]) -> Set[str]:
         """
-        Retrieve skills for multiple queries in parallel.
+        对多个子查询并行检索，合并去重得到候选 Skill 集合。
+
+        对每个子查询调用 HybridRetriever.async_search（BM25 + 向量混合检索），
+        使用 asyncio.gather 并发执行所有查询，
+        只保留得分 ≥ min_score 的结果，取各查询前 top_k 条。
 
         Args:
-            queries: List of search queries.
+            queries: 由 _analyze_query 生成的子查询列表。
 
         Returns:
-            Set of unique skill_ids from all queries.
+            所有子查询检索结果合并后的 skill_id 集合（自动去重）。
         """
         if not self.retriever:
             return set()
@@ -1511,15 +1561,23 @@ class AutoSkills:
             mode: Literal['fast', 'deep'] = 'fast'
     ) -> Set[str]:
         """
-        Filter skills based on relevance to the query.
+        用 LLM 对候选 Skill 集合进行相关性过滤。
+
+        两种过滤模式：
+        - fast（快速过滤）：只提供名称+描述，让 LLM 快速淘汰明显不相关的 Skill
+        - deep（深度过滤）：包含 SKILL.md 内容（最多 3000 字符），
+          LLM 通过 skill_analysis.can_execute 字段逐一判断能否执行当前任务
+
+        候选集 ≤ 1 时跳过过滤直接返回。
+        deep 模式下额外检查 can_execute 字段，明确不能执行的 Skill 会被移除。
 
         Args:
-            query: User's query.
-            skill_ids: Set of candidate skill_ids.
-            mode: 'fast' for name+description only, 'deep' for full content analysis.
+            query:     用户任务描述。
+            skill_ids: 待过滤的候选 Skill ID 集合。
+            mode:      过滤模式，'fast' 或 'deep'。
 
         Returns:
-            Set of filtered skill_ids that are relevant.
+            过滤后的 Skill ID 集合。
         """
         if len(skill_ids) <= 1:
             return skill_ids
@@ -1662,14 +1720,18 @@ class AutoSkills:
             valid_ids: Set[str]
     ) -> List[Union[str, List[str]]]:
         """
-        Validate execution order, keeping only valid skill IDs.
+        清洗 LLM 返回的 execution_order，过滤掉不在 valid_ids 中的 skill_id。
+
+        处理逻辑：
+        - 字符串项：直接检查是否在 valid_ids 中，不在则丢弃
+        - 列表项（并行组）：逐个过滤，若组内只剩 1 个 Skill 则展开为字符串项
 
         Args:
-            raw_order: Raw execution order from LLM.
-            valid_ids: Set of valid skill IDs.
+            raw_order:  LLM 原始返回的执行顺序。
+            valid_ids:  经过过滤后的合法 skill_id 集合。
 
         Returns:
-            Validated execution order with only valid skill IDs.
+            仅含合法 skill_id 的执行顺序。
         """
         result = []
         for item in raw_order:
@@ -1776,14 +1838,10 @@ class AutoSkills:
             valid_skill_ids: Set[str]
     ) -> List[Union[str, List[str]]]:
         """
-        Filter execution order to only include valid skill_ids.
+        从 execution_order 中移除不在 valid_skill_ids 中的条目（功能与 _validate_execution_order 相同）。
 
-        Args:
-            execution_order: Original execution order (may contain parallel groups).
-            valid_skill_ids: Set of skill_ids that should be kept.
-
-        Returns:
-            Filtered execution order with only valid skills.
+        两者逻辑一致，此方法供外部过滤场景使用（如运行时动态调整执行范围）。
+        处理并行组时，若过滤后组内只剩 1 个 Skill，自动展开为字符串项。
         """
         filtered = []
         for item in execution_order:
@@ -1801,16 +1859,21 @@ class AutoSkills:
 
     def _direct_select_skills(self, query: str) -> SkillDAGResult:
         """
-        Directly select skills using LLM with all skills in context.
+        直接选择模式：将所有 Skill 放入 LLM 上下文，一次性完成选择 + DAG 构建。
 
-        Used when enable_retrieve=False. Puts all skills into LLM context
-        and lets LLM select relevant skills and build DAG in one call.
+        适用于 Skill 数量较少（≤ 10）或显式设置 enable_retrieve=False 的场景。
+        LLM 在同一个 prompt 中完成：
+        - 判断是否需要 Skill（needs_skills）
+        - 选出相关的 skill_id 列表
+        - 构建依赖 DAG 和 execution_order
+
+        相比检索模式少了多步 LLM 调用，但当 Skill 数量多时 Token 消耗会很高。
 
         Args:
-            query: User's task query.
+            query: 用户任务描述。
 
         Returns:
-            SkillDAGResult containing the skill execution DAG.
+            SkillDAGResult，含选定的 Skill 和执行 DAG。
         """
         prompt = PROMPT_DIRECT_SELECT_SKILLS.format(
             query=query, all_skills=self._get_all_skills_context())
@@ -1975,7 +2038,11 @@ class AutoSkills:
             clarification=clarification)
 
     def _get_container(self) -> SkillContainer:
-        """Get or create SkillContainer instance."""
+        """
+        懒加载方式获取 SkillContainer 实例（首次调用时创建，后续复用）。
+
+        将 kwargs 中与容器相关的参数（timeout/image/memory_limit 等）过滤后传入。
+        """
         if self._container is None:
             self._container = SkillContainer(
                 workspace_dir=self.work_dir,
@@ -1990,7 +2057,12 @@ class AutoSkills:
         return self._container
 
     def _get_executor(self) -> DAGExecutor:
-        """Get or create DAGExecutor instance."""
+        """
+        懒加载方式获取 DAGExecutor 实例（首次调用时创建，后续复用）。
+
+        固定启用渐进式分析（enable_progressive_analysis=True），
+        并将 AutoSkills 的 max_retries 传入执行器。
+        """
         if self._executor is None:
             container = self._get_container()
             self._executor = DAGExecutor(
@@ -2008,22 +2080,25 @@ class AutoSkills:
                           stop_on_failure: bool = True,
                           query: str = '') -> DAGExecutionResult:
         """
-        Execute the skill DAG from a SkillDAGResult.
+        执行已构建好的 Skill DAG。
 
-        Executes skills according to the execution_order, handling:
-        - Sequential execution for single skill items
-        - Parallel execution for skill groups (sublists)
-        - Input/output linking between dependent skills
-        - Progressive skill analysis (plan -> load -> execute)
+        按 dag_result.execution_order 顺序执行各 Skill，支持：
+        - 串行执行（字符串项）
+        - 并行执行（列表项，通过 asyncio.gather）
+        - 上下游数据传递（上游输出注入为环境变量）
+        - 渐进式分析（每个 Skill 独立 Plan → Load → Execute）
+
+        执行完成后将 DAGExecutionResult 写入 dag_result.execution_result，
+        方便调用方通过同一个对象获取所有信息。
 
         Args:
-            dag_result: SkillDAGResult containing DAG and execution order.
-            execution_input: Optional initial input for skills.
-            stop_on_failure: Whether to stop on first failure.
-            query: User query for progressive skill analysis.
+            dag_result:      get_skill_dag() 返回的 DAG 结果。
+            execution_input: 所有 Skill 共享的初始输入（可为 None）。
+            stop_on_failure: 首次失败后是否停止后续 Skill 的执行。
+            query:           用户 query，供渐进式分析使用。
 
         Returns:
-            DAGExecutionResult with all execution outcomes.
+            DAGExecutionResult，含各 Skill 的执行结果和总耗时。
         """
         if not dag_result.is_complete:
             logger.warning('DAG is not complete, execution may fail')
@@ -2049,31 +2124,36 @@ class AutoSkills:
         return result
 
     def get_execution_spec(self) -> Optional[str]:
-        """Get the execution spec log as markdown string."""
+        """获取执行规格日志（Markdown 格式字符串）；容器未初始化时返回 None。"""
         if self._container:
             return self._container.get_spec_log()
         return None
 
     def save_execution_spec(self,
                             output_path: Optional[Union[str, Path]] = None):
-        """Save the execution spec to a markdown file."""
+        """将执行规格日志保存为 Markdown 文件；output_path 为 None 时使用默认路径。"""
         if self._container:
             self._container.save_spec_log(output_path)
 
     def cleanup(self, keep_spec: bool = True):
-        """Clean up container workspace."""
+        """
+        清理容器工作目录（临时文件、沙箱产物等）。
+
+        Args:
+            keep_spec: 是否保留执行规格日志文件（默认保留，方便事后分析）。
+        """
         if self._container:
             self._container.cleanup(keep_spec=keep_spec)
 
     def get_skill_context(self, skill_id: str) -> Optional[SkillContext]:
         """
-        Get the skill context for an executed skill.
+        获取指定 Skill 的执行上下文（含渐进式分析计划和已加载资源）。
 
         Args:
-            skill_id: The skill identifier (e.g., 'pdf@latest').
+            skill_id: Skill 标识符（如 'pdf@latest'）。
 
         Returns:
-            SkillContext if the skill was executed, None otherwise.
+            SkillContext（若该 Skill 已执行），否则返回 None。
         """
         if self._executor:
             return self._executor.get_skill_context(skill_id)
@@ -2081,10 +2161,10 @@ class AutoSkills:
 
     def get_all_skill_contexts(self) -> Dict[str, SkillContext]:
         """
-        Get all skill contexts from executed skills.
+        获取所有已执行 Skill 的上下文字典。
 
         Returns:
-            Dict mapping skill_id to SkillContext.
+            Dict，key 为 skill_id，value 为对应的 SkillContext。
         """
         if self._executor:
             return self._executor.get_all_contexts()
@@ -2092,10 +2172,7 @@ class AutoSkills:
 
     def get_executed_skill_ids(self) -> List[str]:
         """
-        Get list of skill_ids that were executed.
-
-        Returns:
-            List of skill_ids with available contexts.
+        返回所有已执行 Skill 的 ID 列表（有 SkillContext 记录的即为已执行）。
         """
         if self._executor:
             return self._executor.get_executed_skill_ids()
@@ -2108,18 +2185,22 @@ class AutoSkills:
             stop_on_failure: bool = True
     ) -> SkillDAGResult:
         """
-        Run skill retrieval and execute the resulting DAG in one call.
+        一键执行：检索 Skill → 构建 DAG → 执行 DAG，返回完整结果。
 
-        Combines get_skill_dag() and execute_dag().
-        Uses progressive skill analysis for each skill execution.
+        等价于依次调用 get_skill_dag() + execute_dag()，适合大多数使用场景。
+
+        短路逻辑：
+        - 若 query 是纯聊天（chat_response 非空）→ 直接返回，不执行任何 Skill
+        - 若 Skill 集合不完整（is_complete=False）→ 直接返回，等待用户补充信息
+        - 若 execution_order 为空 → 跳过执行（无需运行任何 Skill）
 
         Args:
-            query: User's task query.
-            execution_input: Optional initial input for skills.
-            stop_on_failure: Whether to stop on first failure.
+            query:           用户任务描述。
+            execution_input: 所有 Skill 共享的初始输入（可为 None）。
+            stop_on_failure: 首次 Skill 失败后是否停止后续执行。
 
         Returns:
-            SkillDAGResult with execution_result populated.
+            SkillDAGResult，其中 execution_result 字段包含 DAG 执行结果。
         """
         dag_result = await self.get_skill_dag(query)
 
