@@ -19,15 +19,19 @@ Agent 构建器（工厂类）模块。
 
 import importlib
 import inspect
+import logging
 import os
 import sys
 from typing import Dict, Optional
 
 from ms_agent.config.config import Config
 from ms_agent.utils.constants import DEFAULT_AGENT_FILE, DEFAULT_TAG
+from ms_agent.utils.logger import get_logger
 from omegaconf import DictConfig, OmegaConf
 
 from .base import Agent
+
+logger = get_logger(__name__)
 
 
 class AgentLoader:
@@ -72,16 +76,23 @@ class AgentLoader:
         """
         agent_config: Optional[DictConfig] = None
 
+        logger.info(f'[AgentLoader] build() called with config_dir_or_id={config_dir_or_id}, tag={tag}')
+        logger.info(f'[AgentLoader] kwargs: {list(kwargs.keys())}')
+
         # 步骤 1：从路径或 Hub ID 加载配置文件
         if config_dir_or_id is not None:
+            logger.info(f'[AgentLoader] Loading config from {config_dir_or_id}')
             if not os.path.exists(config_dir_or_id):
                 # 本地路径不存在，尝试作为 ModelScope Hub 仓库 ID 下载
+                logger.info(f'[AgentLoader] Path does not exist, attempting ModelScope download')
                 from modelscope import snapshot_download
                 config_dir_or_id = snapshot_download(config_dir_or_id)
             agent_config: DictConfig = Config.from_task(config_dir_or_id, env)
+            logger.info(f'[AgentLoader] Config loaded: {list(agent_config.keys()) if agent_config else "None"}')
 
         # 步骤 2：将传入的 config 参数与文件配置合并
         if config is not None:
+            logger.info(f'[AgentLoader] Merging with provided config')
             if agent_config is not None:
                 # 已有文件配置，将传入配置叠加合并（传入配置覆盖文件配置）
                 agent_config = OmegaConf.merge(agent_config, config)
@@ -97,6 +108,7 @@ class AgentLoader:
             agent_tag = tag
         agent_config.tag = agent_tag
         agent_config.trust_remote_code = trust_remote_code
+        logger.info(f'[AgentLoader] Agent tag set to: {agent_tag}')
 
         # 步骤 4：确保 local_dir 字段存在（供外部代码加载使用）
         if getattr(agent_config, 'local_dir',
@@ -114,34 +126,41 @@ class AgentLoader:
         if 'code_file' in kwargs:
             # 优先使用 kwargs 中显式传入的 code_file
             code_file = kwargs.pop('code_file')
+            logger.info(f'[AgentLoader] code_file from kwargs: {code_file}')
         elif agent_config is not None:
             # 从配置中读取 agent 类型和外部代码文件路径
             agent_type = getattr(agent_config, 'type',
                                  '').lower() or agent_type.lower()
             code_file = getattr(agent_config, 'code_file', None)
+            logger.info(f'[AgentLoader] agent_type from config: {agent_type}, code_file: {code_file}')
         else:
             # 兜底：要求 local_dir 存在，使用默认 agent 文件名
             assert getattr(agent_config, 'local_dir', None) is not None
             code_file = os.path.join(
                 getattr(agent_config, 'local_dir', ''), DEFAULT_AGENT_FILE)
+            logger.info(f'[AgentLoader] Using default code_file: {code_file}')
 
         # 步骤 6：根据是否有外部代码文件选择构建方式
         if code_file is not None:
             # 从外部 Python 文件动态加载自定义 Agent 类
+            logger.info(f'[AgentLoader] Loading external code from {code_file}')
             agent_instance = cls._load_external_code(agent_config, code_file,
                                                      **kwargs)
         else:
             assert agent_config is not None
             if agent_type == LLMAgent.AGENT_NAME.lower():
                 # 构建标准 LLM 智能体
+                logger.info(f'[AgentLoader] Creating LLMAgent instance')
                 agent_instance = LLMAgent(agent_config, agent_tag,
                                           trust_remote_code, **kwargs)
             elif agent_type == CodeAgent.AGENT_NAME.lower():
                 # 构建代码生成专用智能体
+                logger.info(f'[AgentLoader] Creating CodeAgent instance')
                 agent_instance = CodeAgent(agent_config, agent_tag,
                                            trust_remote_code, **kwargs)
             else:
                 raise ValueError(f'Unknown agent type: {agent_type}')
+        logger.info(f'[AgentLoader] Agent {agent_tag} created successfully, type={type(agent_instance).__name__}')
         return agent_instance
 
     @classmethod

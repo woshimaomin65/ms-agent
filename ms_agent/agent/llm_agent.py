@@ -134,12 +134,16 @@ class LLMAgent(Agent):
                  tag: str = DEFAULT_TAG,
                  trust_remote_code: bool = False,
                  **kwargs):
+        logger.info(f'[{tag}] LLMAgent.__init__ called with tag={tag}, trust_remote_code={trust_remote_code}')
+        logger.info(f'[{tag}] LLMAgent.__init__ kwargs: {list(kwargs.keys())}')
         # 若配置中缺少 llm 节点，则从默认的 agent.yaml 合并补全
         if not hasattr(config, 'llm'):
             default_yaml = os.path.join(
                 os.path.dirname(os.path.abspath(__file__)), 'agent.yaml')
+            logger.info(f'[{tag}] LLMAgent.__init__ merging with default agent.yaml config')
             llm_config = Config.from_task(default_yaml)
             config = OmegaConf.merge(llm_config, config)
+        logger.info(f'[{tag}] LLMAgent.__init__ calling super().__init__()')
         super().__init__(config, tag, trust_remote_code)
 
         # ── 各核心组件（在 run_loop 中延迟初始化） ──
@@ -154,6 +158,7 @@ class LLMAgent(Agent):
         # ── 缓存续跑相关 ──
         self.load_cache = kwargs.get('load_cache', False)   # 是否从磁盘恢复上次对话历史
         self.config.load_cache = self.load_cache
+        logger.info(f'[{tag}] LLMAgent.__init__ completed, load_cache={self.load_cache}')
 
         # ── MCP（Model Context Protocol）服务器配置 ──
         self.mcp_server_file = kwargs.get('mcp_server_file', None)  # MCP 配置文件路径
@@ -1098,14 +1103,21 @@ class LLMAgent(Agent):
               - 恢复的运行时对象
               - 恢复的消息历史（若无缓存则返回原始 messages）
         """
+        logger.info(f'[{self.tag}] read_history: input messages type={type(messages)}, load_cache={self.load_cache}')
         if isinstance(messages, str):
             query = messages
+            logger.info(f'[{self.tag}] read_history: query from str, len={len(query)}')
         else:
             query = messages[1].content
+            logger.info(f'[{self.tag}] read_history: query from messages[1].content, len={len(query) if query else 0}')
+        logger.info(f'[{self.tag}] read_history: checking cache, query bool={bool(query)}, load_cache={self.load_cache}')
         if not query or not self.load_cache:
+            logger.info(f'[{self.tag}] read_history: skipping cache load, returning current config/runtime')
             return self.config, self.runtime, messages
 
+        logger.info(f'[{self.tag}] read_history: calling read_history() from disk, output_dir={self.output_dir}, tag={self.tag}')
         config, _messages = read_history(self.output_dir, self.tag)
+        logger.info(f'[{self.tag}] read_history: disk read completed, config={config is not None}, messages count={len(_messages) if _messages else 0}')
         if config is not None and _messages is not None:
             if hasattr(config, 'runtime'):
                 runtime = Runtime(llm=self.llm)
@@ -1307,9 +1319,12 @@ class LLMAgent(Agent):
 
             if messages is None:
                 messages = self.query  # 从配置或标准输入获取查询
+            logger.info(f'[{self.tag}] Messages type: {type(messages)}, content preview: {str(messages)[:100]}...')
 
             # ── 步骤 2：断点续跑 - 从磁盘恢复历史状态 ──
+            logger.info(f'[{self.tag}] Calling read_history()...')
             self.config, self.runtime, messages = self.read_history(messages)
+            logger.info(f'[{self.tag}] read_history() completed, round={self.runtime.round}')
 
             if self.runtime.round == 0:
                 logger.info(f'[{self.tag}] First round initialization')
