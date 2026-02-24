@@ -13,7 +13,11 @@ import json
 from ms_agent.llm.utils import Tool, ToolCall
 from ms_agent.tools.agent_tool import AgentTool
 from ms_agent.tools.base import ToolBase
-from ms_agent.tools.code import CodeExecutionTool, LocalCodeExecutionTool
+from ms_agent.tools.code import (
+    CodeExecutionTool,
+    LocalCodeExecutionTool,
+    SimpleCodeExecutionTool,
+)
 from ms_agent.tools.filesystem_tool import FileSystemTool
 from ms_agent.tools.image_generator import ImageGenerator
 from ms_agent.tools.mcp_client import MCPClient
@@ -65,18 +69,25 @@ class ToolManager:
         if hasattr(config, 'tools') and hasattr(config.tools, 'code_executor'):
             code_exec_cfg = getattr(config.tools, 'code_executor')
             implementation = getattr(code_exec_cfg, 'implementation',
-                                     'sandbox')
+                                     'simple')
+            logger.info(f'[ToolManager] Code executor implementation: {implementation}')
             if isinstance(implementation,
                           str) and implementation.lower() == 'python_env':
+                logger.info('[ToolManager] Using LocalCodeExecutionTool (ipykernel based)')
                 self.extra_tools.append(LocalCodeExecutionTool(config))
             elif isinstance(implementation,
                             str) and implementation.lower() == 'sandbox':
+                logger.info('[ToolManager] Using CodeExecutionTool (Docker sandbox based)')
                 self.extra_tools.append(CodeExecutionTool(config))
+            elif isinstance(implementation,
+                          str) and implementation.lower() == 'simple':
+                logger.info('[ToolManager] Using SimpleCodeExecutionTool (subprocess based)')
+                self.extra_tools.append(SimpleCodeExecutionTool(config))
             else:
                 logger.warning(
                     f'Unknown code execution implementation: {implementation},'
-                    f'using sandbox instead.')
-                self.extra_tools.append(CodeExecutionTool(config))
+                    f'using simple subprocess instead.')
+                self.extra_tools.append(SimpleCodeExecutionTool(config))
         if hasattr(config, 'tools') and hasattr(config.tools,
                                                 'financial_data_fetcher'):
             from ms_agent.tools.findata.findata_fetcher import FinancialDataFetcher
