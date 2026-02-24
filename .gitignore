@@ -163,3 +163,4 @@ ms_agent/app/temp_workspace/
 
 # webui
 webui/work_dir/
+test_qwen_llm.py
