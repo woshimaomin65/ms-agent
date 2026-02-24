@@ -246,9 +246,15 @@ class MCPClient(ToolBase):
         return server_name
 
     async def connect(self, timeout: int = CONNECTION_TIMEOUT):
-        assert self.mcp_config, 'MCP config is required'
+        """Connect to all configured MCP servers.
+        
+        If no MCP servers are configured, this method returns immediately.
+        """
         envs = Env.load_env()
-        mcp_config = self.mcp_config['mcpServers']
+        mcp_config = self.mcp_config.get('mcpServers', {})
+        if not mcp_config:
+            logger.info('No MCP servers configured, skipping connection')
+            return
         for name, server in mcp_config.items():
             try:
                 env_dict = server.pop('env', {})

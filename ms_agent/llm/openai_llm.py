@@ -176,6 +176,9 @@ class OpenAI(LLM):
             Union[Message, Generator[Message, None, None]]: Either a single Message object (non-streaming)
                 or a generator yielding Message chunks (streaming).
         """
+        logger.info(f'[LLM] generate() called with {len(messages)} messages, {len(tools) if tools else 0} tools')
+        logger.info(f'[LLM] Model: {self.model}, Stream: {kwargs.get("stream", False)}')
+        
         parameters = inspect.signature(
             self.client.chat.completions.create).parameters
         args = self.args.copy()
@@ -183,7 +186,9 @@ class OpenAI(LLM):
         stream = args.get('stream', False)
 
         args = {key: value for key, value in args.items() if key in parameters}
+        logger.info(f'[LLM] Calling {self.model} API...')
         completion = self._call_llm(messages, self.format_tools(tools), **args)
+        logger.info(f'[LLM] API response received')
 
         # Complex task may produce long response
         # Call continue_generate to keep generating if the finish_reason is `length`

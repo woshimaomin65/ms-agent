@@ -142,20 +142,36 @@ class ToolManager:
         self.extra_tools.append(tool)
 
     async def connect(self):
+        logger.info(f'[ToolManager] Starting connect...')
+        logger.info(f'[ToolManager] Extra tools: {[type(t).__name__ for t in self.extra_tools]}')
         if self.mcp_client and isinstance(self.mcp_client, MCPClient):
+            logger.info(f'[ToolManager] Using provided MCP client')
             self.servers = self.mcp_client
             await self.servers.add_mcp_config(self.mcp_config)
             self.mcp_config = self.servers.mcp_config
-        else:
+        elif self.mcp_config and self.mcp_config.get('mcpServers'):
+            logger.info(f'[ToolManager] Connecting to MCP servers...')
+            # Only connect to MCP servers if config is provided
             self.servers = MCPClient(self.mcp_config, self.config)
             await self.servers.connect()
-        for tool in self.extra_tools:
+        else:
+            # No MCP config, create empty MCPClient
+            logger.info('[ToolManager] No MCP config found, skipping MCP connection')
+            #self.servers = MCPClient(self.mcp_config, self.config)
+        
+        for i, tool in enumerate(self.extra_tools):
+            logger.info(f'[ToolManager] Connecting tool {i+1}/{len(self.extra_tools)}: {type(tool).__name__}')
             await tool.connect()
+            logger.info(f'[ToolManager] Tool {type(tool).__name__} connected')
+        
+        logger.info(f'[ToolManager] Reindexing tools...')
         await self.reindex_tool()
+        logger.info(f'[ToolManager] Tools reindexed')
 
         # Initialize concurrency limiter
         self._concurrent_limiter = asyncio.Semaphore(MAX_CONCURRENT_TOOLS)
         logger.info(f'Tool concurrency limit set to {MAX_CONCURRENT_TOOLS}')
+        logger.info(f'[ToolManager] Connect completed')
 
     async def cleanup(self):
         if self._managed_client and self.servers:
@@ -187,9 +203,15 @@ class ToolManager:
                 tool['tool_name'] = key
                 self._tool_index[key] = (tool_ins, server_name, tool)
 
-        mcps = await self.servers.get_tools()
-        for server_name, tool_list in mcps.items():
-            extend_tool(self.servers, server_name, tool_list)
+        # Get tools from MCP servers (if any)
+        if self.servers and self.servers.sessions:
+            mcps = await self.servers.get_tools()
+            for server_name, tool_list in mcps.items():
+                extend_tool(self.servers, server_name, tool_list)
+        else:
+            logger.info('No MCP sessions, skipping MCP tool indexing')
+        
+        # Get tools from extra tools
         for extra_tool in self.extra_tools:
             tools = await extra_tool.get_tools()
             for server_name, tool_list in tools.items():

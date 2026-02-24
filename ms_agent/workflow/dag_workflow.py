@@ -69,19 +69,29 @@ class DagWorkflow(Workflow):
         Returns:
             Dict[str, Any]: mapping of terminal task name to its output.
         """
+        logger.info(f'[DagWorkflow] Starting workflow: {self.WORKFLOW_NAME}')
+        logger.info(f'[DagWorkflow] Total tasks: {len(self.topo_order)}')
+        logger.info(f'[DagWorkflow] Task order: {self.topo_order}')
+        
         outputs: Dict[str, Any] = {}
-        for task in self.topo_order:
+        for idx, task in enumerate(self.topo_order):
+            logger.info(f'[DagWorkflow] Executing task {idx+1}/{len(self.topo_order)}: {task}')
+            
             # Prepare input for task
             if task in self.roots:
                 task_input = inputs
+                logger.info(f'[DagWorkflow] Task {task} is a root task, using initial inputs')
             else:
                 parent_outs = [outputs[p] for p in self.parents[task]]
                 task_input = parent_outs if len(
                     parent_outs) > 1 else parent_outs[0]
+                logger.info(f'[DagWorkflow] Task {task} receives input from parents: {self.parents[task]}')
 
             task_info: DictConfig = getattr(self.config, task)
             agent_cfg_path = os.path.join(self.config.local_dir,
                                           task_info.agent_config)
+            logger.info(f'[DagWorkflow] Agent config path: {agent_cfg_path}')
+            
             if not hasattr(task_info, 'agent'):
                 task_info.agent = DictConfig({})
             init_args = getattr(task_info.agent, 'kwargs', {})
@@ -93,8 +103,14 @@ class DagWorkflow(Workflow):
             init_args['env'] = self.env
             if 'tag' not in init_args:
                 init_args['tag'] = task
+            
+            logger.info(f'[DagWorkflow] Building agent for task: {task}')
             engine = AgentLoader.build(**init_args)
+            
+            logger.info(f'[DagWorkflow] Running agent for task: {task}')
             result = await engine.run(task_input)
+            logger.info(f'[DagWorkflow] Task {task} completed, result type: {type(result)}')
+            
             outputs[task] = result
 
         # Return results of terminal nodes (no outgoing edges)

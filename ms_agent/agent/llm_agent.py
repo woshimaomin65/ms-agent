@@ -624,12 +624,15 @@ class LLMAgent(Agent):
 
     async def prepare_tools(self):
         """初始化 ToolManager 并建立与所有工具（含 MCP 服务）的连接。"""
+        logger.info(f'[{self.tag}] Creating ToolManager...')
         self.tool_manager = ToolManager(
             self.config,
             self.mcp_config,
             self.mcp_client,
             trust_remote_code=self.trust_remote_code)
+        logger.info(f'[{self.tag}] Connecting ToolManager...')
         await self.tool_manager.connect()
+        logger.info(f'[{self.tag}] ToolManager connected')
 
     async def cleanup_tools(self):
         """释放 ToolManager 持有的所有工具资源（如关闭 MCP 连接）。"""
@@ -949,11 +952,15 @@ class LLMAgent(Agent):
         Yields:
             List[Message]: 每次 LLM 生成 token（流式）或完成整步后更新的消息历史。
         """
+        logger.info(f'[{self.tag}] step() called')
         messages = deepcopy(messages)
         if (not self.load_cache) or messages[-1].role != 'assistant':
+            logger.info(f'[{self.tag}] Condensing memory...')
             messages = await self.condense_memory(messages)
             await self.on_generate_response(messages)
+            logger.info(f'[{self.tag}] Getting tools...')
             tools = await self.tool_manager.get_tools()
+            logger.info(f'[{self.tag}] Tools retrieved: {len(tools)} tools available')
 
             if self.stream:
                 self.log_output('[assistant]:')
@@ -996,7 +1003,9 @@ class LLMAgent(Agent):
                 sys.stdout.write('\n')
             else:
                 # 非流式：等待完整响应
+                logger.info(f'[{self.tag}] Calling LLM generate()...')
                 _response_message = self.llm.generate(messages, tools=tools)
+                logger.info(f'[{self.tag}] LLM response received')
                 if self.show_reasoning:
                     reasoning_text = getattr(_response_message,
                                              'reasoning_content', '') or ''
@@ -1007,6 +1016,7 @@ class LLMAgent(Agent):
                 if _response_message.content:
                     self.log_output('[assistant]:')
                     self.log_output(_response_message.content)
+                    logger.info(f'[{self.tag}] Response content length: {len(_response_message.content)} chars')
 
             # LLM 响应生成完毕，规范化并追加到消息历史
             self.handle_new_response(messages, _response_message)
@@ -1277,15 +1287,22 @@ class LLMAgent(Agent):
             Exception: 运行时异常向上传播，并打印 traceback 日志。
         """
         try:
+            logger.info(f'[{self.tag}] run_loop starting')
             # ── 步骤 1：初始化所有组件 ──
             self.max_chat_round = getattr(self.config, 'max_chat_round',
                                           LLMAgent.DEFAULT_MAX_CHAT_ROUND)
             self.register_callback_from_config()
+            logger.info(f'[{self.tag}] Initializing Llm...')
             self.prepare_llm()
+            logger.info(f'[{self.tag}] Initializing runtime...')
             self.prepare_runtime()
-            await self.prepare_tools()
+            logger.info(f'[{self.tag}] Loading memory...')
             await self.load_memory()
+            logger.info(f'[{self.tag}] Preparing RAG...')
             await self.prepare_rag()
+            logger.info(f'[{self.tag}] Preparing tools...')
+            await self.prepare_tools()
+            logger.info(f'[{self.tag}] All components initialized')
             self.runtime.tag = self.tag
 
             if messages is None:
@@ -1295,13 +1312,17 @@ class LLMAgent(Agent):
             self.config, self.runtime, messages = self.read_history(messages)
 
             if self.runtime.round == 0:
+                logger.info(f'[{self.tag}] First round initialization')
                 # ── 步骤 3：首轮初始化 ──
                 # 3a. 标准化消息格式
+                logger.info(f'[{self.tag}] Creating messages...')
                 messages = await self.create_messages(messages)
 
                 # 3b. 技能路由（优先级最高）：命中则直接返回，不进入对话循环
+                logger.info(f'[{self.tag}] Checking skills...')
                 skill_result = await self.do_skill(messages)
                 if skill_result is not None:
+                    logger.info(f'[{self.tag}] Skill matched, executing skill')
                     await self.on_task_begin(skill_result)
                     yield skill_result
                     await self.on_task_end(skill_result)
@@ -1309,15 +1330,16 @@ class LLMAgent(Agent):
                     return
 
                 # 3c. RAG 增强：将检索到的相关文档注入用户查询
+                logger.info(f'[{self.tag}] RAG enhancement...')
                 await self.do_rag(messages)
                 await self.on_task_begin(messages)
+                logger.info(f'[{self.tag}] Entering conversation loop')
 
             # 打印当前所有非 system 消息（方便调试）
             for message in messages:
                 if message.role != 'system':
                     self.log_output('[' + message.role + ']:')
                     self.log_output(message.content)
-
             # ── 步骤 4：对话循环 ──
             while not self.runtime.should_stop:
                 async for messages in self.step(messages):
@@ -1383,7 +1405,24 @@ class LLMAgent(Agent):
             List[Message]: 非流式模式下的最终消息列表。
             AsyncGenerator[List[Message], Any]: 流式模式下的异步生成器。
         """
+        # Log the start of agent execution
+        logger.info(f'[{self.tag}] Agent starting, tag={self.tag}')
+        logger.info(f'[{self.tag}] Input messages type: {type(messages)}')
+        if isinstance(messages, str):
+            preview = messages[:200] + '...' if len(messages) > 200 else messages
+            logger.info(f'[{self.tag}] Input: {preview}')
+        elif isinstance(messages, list):
+            logger.info(f'[{self.tag}] Messages count: {len(messages)}')
+            if messages:
+                last_msg = messages[-1]
+                if hasattr(last_msg, 'content'):
+                    content = last_msg.content
+                    preview = content[:200] + '...' if len(content) > 200 else content
+                    logger.info(f'[{self.tag}] Last message: {preview}')
+        
         stream = kwargs.get('stream', False)
+        logger.info(f'[{self.tag}] Stream mode: {stream}')
+        
         with self.config_context():
             if stream:
                 # 流式模式：将 generation_config.stream 置为 True，返回异步生成器
@@ -1398,7 +1437,9 @@ class LLMAgent(Agent):
                 return stream_generator()
             else:
                 # 非流式模式：消费所有 chunk，仅保留最后一个（最终结果）
+                logger.info(f'[{self.tag}] Starting run_loop in non-stream mode')
                 res = None
                 async for chunk in self.run_loop(messages=messages, **kwargs):
                     res = chunk
+                logger.info(f'[{self.tag}] run_loop completed')
                 return res
