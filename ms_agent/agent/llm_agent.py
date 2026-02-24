@@ -1316,7 +1316,6 @@ class LLMAgent(Agent):
             await self.prepare_tools()
             logger.info(f'[{self.tag}] All components initialized')
             self.runtime.tag = self.tag
-
             if messages is None:
                 messages = self.query  # 从配置或标准输入获取查询
             logger.info(f'[{self.tag}] Messages type: {type(messages)}, content preview: {str(messages)[:100]}...')

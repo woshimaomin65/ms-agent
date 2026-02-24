@@ -1,7 +1,17 @@
 # Disable frozen modules warning for debugger
 # This must be set before any other imports
+import glob
 import os
+import shutil
 os.environ['PYDEVD_DISABLE_FILE_VALIDATION'] = '1'
+
+# Clean up old temp directories from previous runs
+for old_dir in glob.glob('/tmp/tmp*/agent'):
+    try:
+        shutil.rmtree(os.path.dirname(old_dir))
+        print(f'Cleaned up old temp directory: {os.path.dirname(old_dir)}')
+    except Exception:
+        pass
 
 import ast
 import asyncio
@@ -262,7 +272,7 @@ def create_base_agent_config():
                 'mcp': False,
             },
             'code_executor': {
-                'implementation': 'python_env',
+                'implementation': 'simple',
                 'mcp': False,
             },
             'todo_list': {
@@ -357,7 +367,8 @@ def create_workflow_config(py_files: List[str], batch_size: int = 5):
 已扫描到的文件列表：
 {chr(10).join(py_files)}
 
-请输出这个文件列表供后续处理。'''
+请输出这个文件列表供后续处理。''',
+        'query': '请扫描并输出文件列表'
     }
     with open(os.path.join(agent_dir, 'scanner_agent.yaml'), 'w', encoding='utf-8') as f:
         yaml.dump(scanner_config, f, default_flow_style=False, allow_unicode=True)
@@ -372,7 +383,8 @@ def create_workflow_config(py_files: List[str], batch_size: int = 5):
 文件批次：
 {chr(10).join([f"批次 {i}: {batch}" for i, batch in enumerate(batches)])}
 
-请将每个批次的任务分发给对应的 subagent。'''
+请将每个批次的任务分发给对应的 subagent。''',
+        'query': '请分发任务给各个 subagent'
     }
     with open(os.path.join(agent_dir, 'dispatcher_agent.yaml'), 'w', encoding='utf-8') as f:
         yaml.dump(dispatcher_config, f, default_flow_style=False, allow_unicode=True)
@@ -400,7 +412,8 @@ def create_workflow_config(py_files: List[str], batch_size: int = 5):
 - 使用专业的技术术语
 - 如果文件已有部分中文注释，补充缺失的部分
 
-请用中文回复，并直接输出修改后的完整代码。'''
+请用中文回复，并直接输出修改后的完整代码。''',
+        'query': '请为给定的 Python 文件添加中文注释'
     }
     with open(os.path.join(agent_dir, 'subagent.yaml'), 'w', encoding='utf-8') as f:
         yaml.dump(subagent_config, f, default_flow_style=False, allow_unicode=True)
