@@ -44,7 +44,7 @@ class ToolManager:
                  mcp_client: Optional[MCPClient] = None,
                  **kwargs):
         self.config = config
-        self.trust_remote_code = kwargs.get('trust_remote_code', False)
+        self.trust_remote_code = kwargs.get('trust_remote_code', True)
 
         self.extra_tools: List[ToolBase] = []
         self.has_split_task_tool = False
